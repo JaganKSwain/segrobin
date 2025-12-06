@@ -19,29 +19,70 @@ class CameraML:
         self.picam2.start()
         time.sleep(1.0)  # sensor warm‑up
 
-        # TODO: load your real ML model here
-        # Example for ONNX:
-        # import onnxruntime as ort
-        # self.session = ort.InferenceSession(
-        #     self.model_path, providers=["CPUExecutionProvider"]
-        # )
-        self.session = None
+        # Load TFLite model
+        try:
+            import tensorflow.lite as tflite
+        except ImportError:
+            raise ImportError("Please install 'tensorflow'")
+
+        print(f"Loading model from {self.model_path}...")
+        self.interpreter = tflite.Interpreter(model_path=self.model_path)
+        self.interpreter.allocate_tensors()
+
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        
+        self.input_shape = self.input_details[0]['shape']
+        print(f"Model input shape: {self.input_shape}")
 
     def _preprocess(self, frame_rgb):
         """
-        Convert the PiCamera2 RGB frame (H,W,3) to the input format
-        your ML model expects. Replace this stub with your pipeline.
+        Resize and normalize frame for TFLite model.
         """
-        # Example (no real preprocessing):
-        return frame_rgb
+        import cv2
+        import numpy as np
+
+        # Get target size from model input (e.g., [1, 224, 224, 3])
+        # input_details[0]['shape'] usually looks like [1, height, width, channels]
+        target_h = self.input_shape[1]
+        target_w = self.input_shape[2]
+
+        resized = cv2.resize(frame_rgb, (target_w, target_h))
+        
+        # Check if model expects float or int
+        if self.input_details[0]['dtype'] == np.float32:
+            # Normalize to [0, 1] if model expects float
+            input_data = np.expand_dims(resized, axis=0).astype(np.float32) / 255.0
+        else:
+            # Keep as uint8 if model expects int (quantized)
+            input_data = np.expand_dims(resized, axis=0).astype(self.input_details[0]['dtype'])
+            
+        return input_data
 
     def _run_inference(self, input_data):
         """
-        Run model on input_data and return label string.
-        Replace this stub with real inference + label mapping.
+        Run TFLite inference and return label.
         """
-        # Example dummy logic:
-        return "generic_object"
+        import numpy as np
+        
+        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        self.interpreter.invoke()
+
+        output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
+        
+        # Assuming classification model output is [1, num_classes]
+        # Map index to label
+        # TODO: Update these labels to match your specific model's training
+        labels = ["organic", "recyclable", "hazardous"] 
+        
+        # Get index of highest confidence
+        prediction_index = np.argmax(output_data[0])
+        
+        # Safety check if index is out of bounds
+        if prediction_index < len(labels):
+            return labels[prediction_index]
+        else:
+            return "unknown"
 
     def classify_object(self) -> str:
         """

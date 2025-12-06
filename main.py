@@ -10,20 +10,23 @@ from config import (
     MQTT_CLIENT_ID,
     ULTRASONIC_1_TRIGGER,
     ULTRASONIC_1_ECHO,
-    ULTRASONIC_3_TRIGGER,
-    ULTRASONIC_3_ECHO,
-    ULTRASONIC_4_TRIGGER,
-    ULTRASONIC_4_ECHO,
+    ULTRASONIC_REC_TRIGGER,
+    ULTRASONIC_REC_ECHO,
+    ULTRASONIC_ORG_TRIGGER,
+    ULTRASONIC_ORG_ECHO,
+    ULTRASONIC_HAZ_TRIGGER,
+    ULTRASONIC_HAZ_ECHO,
     SERVO_1_PIN,
     SERVO_2_PIN,
     LED_RED_PIN,
     BUZZER_PIN,
     DIST_THRESHOLD_OBJECT_CM,
     DIST_THRESHOLD_BIN_FULL_CM,
-    LOAD_THRESHOLD_FULL,
+    LOAD_THRESHOLD_FULL_REC,
     CAMERA_INDEX,
     MODEL_PATH,
 )
+
 
 from hardware.ultrasonic import UltrasonicSensor
 from hardware.servo import Servo
@@ -45,9 +48,9 @@ signal.signal(signal.SIGINT, handle_sigint)
 
 def main():
     us_inlet = UltrasonicSensor(ULTRASONIC_1_TRIGGER, ULTRASONIC_1_ECHO)
-    us_bin_1 = UltrasonicSensor(ULTRASONIC_3_TRIGGER, ULTRASONIC_3_ECHO)
-    us_bin_2 = UltrasonicSensor(ULTRASONIC_4_TRIGGER, ULTRASONIC_4_ECHO)
-
+    us_bin_rec = UltrasonicSensor(ULTRASONIC_REC_TRIGGER, ULTRASONIC_REC_ECHO)
+    us_bin_org = UltrasonicSensor(ULTRASONIC_ORG_TRIGGER, ULTRASONIC_ORG_ECHO)
+    us_bin_haz = UltrasonicSensor(ULTRASONIC_HAZ_TRIGGER, ULTRASONIC_HAZ_ECHO)
     servo_position = Servo(SERVO_1_PIN)   # decides which bin
     servo_flap = Servo(SERVO_2_PIN)       # flips flap
 
@@ -75,15 +78,19 @@ def main():
                 })
 
                 # 3. move servo-1 to bin based on label
-                if label == "plastic":
+                if label == "recyclable":
                     servo_position.set_angle(0)
-                    target_bin = "bin_plastic"
-                elif label == "metal":
-                    servo_position.set_angle(90)
-                    target_bin = "bin_metal"
+                    target_bin = "recyclable"
+                elif label == "organic":
+                    servo_position.set_angle(120)
+                    target_bin = "organic"
+                elif label == "hazardous":
+                    servo_position.set_angle(240)
+                    target_bin = "hazardous"
                 else:
-                    servo_position.set_angle(180)
-                    target_bin = "bin_other"
+                    # default: send to recyclable or a fallback bin
+                    servo_position.set_angle(0)
+                    target_bin = "recyclable"
 
                 mqtt_client.publish_status(MQTT_TOPIC_STATUS, {
                     "event": "servo1_positioned",
@@ -91,7 +98,7 @@ def main():
                 })
 
                 # 4. servo-2 flips flap to drop object
-                servo_flap.set_angle(90)
+                servo_flap.set_angle(45)
                 time.sleep(1.0)
                 servo_flap.set_angle(0)
 
@@ -99,45 +106,54 @@ def main():
                     "event": "flap_flipped",
                     "target_bin": target_bin,
                 })
+                # 5. ultrasonic sensors check fill coverage of all three bins
+                dist_rec = us_bin_rec.read_distance_cm()
+                dist_org = us_bin_org.read_distance_cm()
+                dist_haz = us_bin_haz.read_distance_cm()
 
-                # 5. ultrasonic 3 & 4 check fill coverage
-                dist_bin_1 = us_bin_1.read_distance_cm()
-                dist_bin_2 = us_bin_2.read_distance_cm()
                 mqtt_client.publish_status(MQTT_TOPIC_FILLLEVEL, {
-                    "bin_1_distance_cm": dist_bin_1,
-                    "bin_2_distance_cm": dist_bin_2,
+                    "recyclable_distance_cm": dist_rec,
+                    "organic_distance_cm": dist_org,
+                    "hazardous_distance_cm": dist_haz,
                 })
 
-                # 6. load cell checks weight
-                weight = load_cell.read_weight()
+                # 6. load cell under recyclable bin only
+                weight_rec = load_cell.read_weight()
                 mqtt_client.publish_status(MQTT_TOPIC_STATUS, {
-                    "event": "load_checked",
-                    "weight": weight,
+                    "event": "recyclable_weight_checked",
+                    "weight_recyclable": weight_rec,
                 })
 
-                bin_full_ultra = (
-                    dist_bin_1 < DIST_THRESHOLD_BIN_FULL_CM
-                    or dist_bin_2 < DIST_THRESHOLD_BIN_FULL_CM
-                )
-                bin_full_load = weight >= LOAD_THRESHOLD_FULL
-                any_full = bin_full_ultra or bin_full_load
+                # bin-full decisions
+                rec_full_ultra = dist_rec < DIST_THRESHOLD_BIN_FULL_CM
+                org_full_ultra = dist_org < DIST_THRESHOLD_BIN_FULL_CM
+                haz_full_ultra = dist_haz < DIST_THRESHOLD_BIN_FULL_CM
+
+                rec_full_load = weight_rec >= LOAD_THRESHOLD_FULL_REC
+
+                rec_full = rec_full_ultra or rec_full_load
+                org_full = org_full_ultra
+                haz_full = haz_full_ultra
+
+                any_full = rec_full or org_full or haz_full
 
                 if any_full:
-                    # 7. bin full: stop, LED red, buzzer
+                    # 7. at least one bin is full
                     indicators.led_red_on()
                     indicators.beep(2.0)
                     mqtt_client.publish_status(MQTT_TOPIC_STATUS, {
                         "event": "bin_full",
-                        "bin_full_ultra": bin_full_ultra,
-                        "bin_full_load": bin_full_load,
+                        "recyclable_full": rec_full,
+                        "organic_full": org_full,
+                        "hazardous_full": haz_full,
+                        "recyclable_weight": weight_rec,
                     })
-                    # wait until manually stopped
                     while RUNNING:
                         time.sleep(1.0)
                 else:
-                    # 8. not full: wait 10 s and repeat
+                    # 8. none are full: wait 10 s and continue
                     mqtt_client.publish_status(MQTT_TOPIC_STATUS, {
-                        "event": "bin_not_full",
+                        "event": "bins_not_full",
                         "next_cycle_in_sec": 10,
                     })
                     time.sleep(10.0)
